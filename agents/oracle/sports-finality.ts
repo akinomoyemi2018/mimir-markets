@@ -38,6 +38,14 @@ export const SPORTS_EVIDENCE_SOURCE_REF_MAX_LEN = 256
 export const SPORTS_SETTLE_GRACE_SECS =
   Math.max(1, Number(process.env.SPORTS_SETTLE_GRACE_HOURS ?? SPORTS_SETTLE_GRACE_HOURS_DEFAULT)) * 3600
 
+/**
+ * Bounded oracle retry budget per unresolved claim. Evidence acquisition
+ * retries are counted separately from transaction reconciliation so a flaky
+ * evidence source cannot exhaust the settlement retry budget (and vice versa).
+ */
+export const ORACLE_EVIDENCE_RETRY_BUDGET_DEFAULT = 3
+export const ORACLE_SETTLEMENT_RETRY_BUDGET_DEFAULT = 3
+
 /** Claim fields the check needs. */
 export interface SportsClaim {
   /** Settlement deadline, epoch seconds. */
@@ -79,6 +87,70 @@ export function classifyEvidenceFinality(text: string): EvidenceFinalityState {
 /** Heuristic read of the evidence text: is the event conclusively over? */
 function eventLooksFinal(text: string): boolean {
   return classifyEvidenceFinality(text) === 'final'
+}
+
+/** Why a claim is still unresolved after exhausting its retry budget. */
+export type RetryBudgetExhaustedReason = "evidence" | "settlement"
+
+/** Per-claim retry counters, kept separate for evidence vs. settlement. */
+export interface ClaimRetryBudget {
+  claimId: string
+  evidenceAttempts: number
+  settlementAttempts: number
+  evidenceBudget: number
+  settlementBudget: number
+}
+
+/** Outcome of consuming one retry from a claim's budget. */
+export type RetryBudgetDecision =
+  | { allowed: true; budget: ClaimRetryBudget }
+  | { allowed: false; reason: RetryBudgetExhaustedReason; budget: ClaimRetryBudget }
+
+/** Create a fresh retry budget for a claim, honoring optional overrides. */
+export function createClaimRetryBudget(
+  claimId: string,
+  opts: { evidenceBudget?: number; settlementBudget?: number } = {},
+): ClaimRetryBudget {
+  return {
+    claimId,
+    evidenceAttempts: 0,
+    settlementAttempts: 0,
+    evidenceBudget: Math.max(0, opts.evidenceBudget ?? ORACLE_EVIDENCE_RETRY_BUDGET_DEFAULT),
+    settlementBudget: Math.max(0, opts.settlementBudget ?? ORACLE_SETTLEMENT_RETRY_BUDGET_DEFAULT),
+  }
+}
+
+/**
+ * Consume one retry from the given budget. Evidence acquisition and
+ * transaction reconciliation draw from independent counters, so a claim that
+ * keeps failing to fetch evidence does not block settlement retries and a
+ * claim stuck in reconciliation does not block evidence retries.
+ */
+export function consumeRetry(
+  budget: ClaimRetryBudget,
+  kind: RetryBudgetExhaustedReason,
+): RetryBudgetDecision {
+  if (kind === "evidence") {
+    if (budget.evidenceAttempts >= budget.evidenceBudget) {
+      return { allowed: false, reason: "evidence", budget }
+    }
+    return { allowed: true, budget: { ...budget, evidenceAttempts: budget.evidenceAttempts + 1 } }
+  }
+  if (budget.settlementAttempts >= budget.settlementBudget) {
+    return { allowed: false, reason: "settlement", budget }
+  }
+  return { allowed: true, budget: { ...budget, settlementAttempts: budget.settlementAttempts + 1 } }
+}
+
+/**
+ * True when the claim has exhausted either budget and should be skipped for
+ * the remainder of the worker cycle, so one failing claim cannot monopolize it.
+ */
+export function isRetryBudgetExhausted(budget: ClaimRetryBudget): boolean {
+  return (
+    budget.evidenceAttempts >= budget.evidenceBudget &&
+    budget.settlementAttempts >= budget.settlementBudget
+  )
 }
 
 /** One raw evidence item as fetched by a source adapter. */
